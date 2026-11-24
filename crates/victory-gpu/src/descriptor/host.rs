@@ -20,7 +20,8 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// where the host takes them, else what [`view_layout`] leaves them
+    /// (between [`MIN_DYNAMIC`] and [`DYNAMIC`]).
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -35,27 +36,52 @@ pub(crate) struct HostHeap {
     next: Mutex<(u32, Vec<bool>)>,
 }
 
-/// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
-/// device-removed reports: a shader indexing a heap past its end faults.
-static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
+/// A host heap's GPU range, for device-removed reports.
+struct GpuRange {
+    start: u64,
+    bytes: u64,
+    /// Bytes per slot.
+    step: u64,
+    sampler: bool,
+    /// The slots mirroring the title's; dynamic ones follow.
+    title: u64,
+}
+
+/// Host heaps' GPU ranges, for device-removed reports: a shader indexing a
+/// heap past its end faults.
+static GPU_RANGES: Mutex<Vec<GpuRange>> = Mutex::new(Vec::new());
 
 /// For device-removed reports: where host GPU address `va` lies against
 /// the host descriptor heaps.
 pub(crate) fn near_heaps(va: u64) -> String {
     let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let mut text = String::new();
-    for &(start, bytes, step, sampler) in ranges.iter() {
-        let kind = if sampler { "sampler" } else { "view" };
-        let place = if va < start {
-            format!("{:#x} below", start - va)
-        } else if va < start + bytes {
-            format!("inside, slot {}", (va - start) / step)
-        } else {
-            format!("{:#x} past its end (slot {})", va - start - bytes, (va - start) / step)
-        };
+    for r in ranges.iter() {
+        let (start, bytes) = (r.start, r.bytes);
+        let kind = if r.sampler { "sampler" } else { "view" };
+        let place = place_in_heap(va, start, bytes, r.step, r.title);
         text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
     }
     text
+}
+
+/// Where `va` lies in a heap at `start` of `bytes`, `step` bytes a slot,
+/// whose first `title` slots mirror the title's. Past them are dynamic
+/// slots: a direct heap read there with a title index (one past a capped
+/// heap's title range, #747) reads another draw's table.
+fn place_in_heap(va: u64, start: u64, bytes: u64, step: u64, title: u64) -> String {
+    if va < start {
+        return format!("{:#x} below", start - va);
+    }
+    let slot = (va - start) / step;
+    if va >= start + bytes {
+        return format!("{:#x} past its end (slot {slot})", va - start - bytes);
+    }
+    if slot < title {
+        format!("inside, title slot {slot}")
+    } else {
+        format!("inside, dynamic slot {} (slot {slot})", slot - title)
+    }
 }
 
 /// The host's limit for shader-visible view heaps on resource binding
@@ -69,9 +95,56 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// The fewest dynamic slots a heap gets whose host would not take
+/// [`DYNAMIC`] more (a capped heap, NVIDIA) while the title's slots fit.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// How a view heap the title made with `count` slots is laid out on the
+/// host: the host heap `make` created, the title slots it mirrors and the
+/// dynamic slots after them. `make` creates a shader-visible view heap of
+/// the size it is given, or refuses it.
+///
+/// A host that refuses `count` + [`DYNAMIC`] most likely caps view heaps at
+/// [`PORTABLE_VIEWS`] (NVIDIA on binding tier 3 too):
+///
+/// * the title's slots fit below it with at least [`MIN_DYNAMIC`] to
+///   spare: they all stay and the dynamic range gets the rest;
+/// * they do not fit below it, and the host takes them with
+///   [`MIN_DYNAMIC`] more (its cap lies above the portable one): as
+///   before, every title slot and the fewest dynamic ones;
+/// * they do not fit and the host is capped at the portable limit: the
+///   dynamic range keeps all of [`DYNAMIC`]. With 2^16 the world's fresh
+///   tables ran out inside every submission and most of its draws were
+///   dropped; its tables past the smaller title range are made fresh
+///   instead (#747).
+///
+/// Anything else (a host capped lower) gets every title slot and
+/// [`MIN_DYNAMIC`], as before, or no heap.
+fn view_layout<H>(count: u32, mut make: impl FnMut(u32) -> Option<H>) -> Option<(H, u32, u32)> {
+    if let Some(heap) = make(count.saturating_add(DYNAMIC)) {
+        return Some((heap, count, DYNAMIC));
+    }
+    if count <= PORTABLE_VIEWS - MIN_DYNAMIC {
+        let dynamic = (PORTABLE_VIEWS - count).min(DYNAMIC);
+        // `DYNAMIC` was just refused; `MIN_DYNAMIC` is tried below.
+        if MIN_DYNAMIC < dynamic
+            && dynamic < DYNAMIC
+            && let Some(heap) = make(count + dynamic)
+        {
+            return Some((heap, count, dynamic));
+        }
+    } else if let Some(heap) = make(count.saturating_add(MIN_DYNAMIC)) {
+        return Some((heap, count, MIN_DYNAMIC));
+    } else {
+        let heap = make(PORTABLE_VIEWS)?;
+        // shortcut: descriptors past the host's limit are left out; a
+        // title that reaches them needs remapping.
+        tracing::warn!(count, "host view heap capped at {PORTABLE_VIEWS}");
+        return Some((heap, PORTABLE_VIEWS - DYNAMIC, DYNAMIC));
+    }
+    let heap = make(count + MIN_DYNAMIC)?;
+    Some((heap, count, MIN_DYNAMIC))
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -93,8 +166,8 @@ impl HostHeap {
                     })
             }
         };
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
+        // Sampler heaps as the title made them; view heaps with dynamic
+        // slots after the title's (`view_layout`).
         let (heap, count, extra) = if sampler {
             match make(count) {
                 Ok(heap) => (heap, count, 0),
@@ -103,22 +176,15 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
-            (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
-            }
+            let mut refused = None;
+            let Some(layout) = view_layout(count, |n| make(n).map_err(|e| refused = Some(e)).ok())
+            else {
+                let error = refused.map(|e| e.to_string()).unwrap_or_default();
+                tracing::warn!(error, count, sampler, "no host descriptor heap");
+                return None;
+            };
+            layout
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -130,12 +196,16 @@ impl HostHeap {
         tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
-        GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
-            gpu,
-            u64::from(count + extra) * u64::from(step),
-            u64::from(step),
-            sampler,
-        ));
+        GPU_RANGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(GpuRange {
+                start: gpu,
+                bytes: u64::from(count + extra) * u64::from(step),
+                step: u64::from(step),
+                sampler,
+                title: u64::from(count),
+            });
         let h = HostHeap {
             heap,
             cpu,
@@ -248,8 +318,18 @@ impl HostHeap {
             }
         }
         let Some(first) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            // Counted, not warned about once: the world ran out inside every
+            // submission while the log showed one line (#747).
+            static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let failed = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if failed.is_power_of_two() {
+                tracing::warn!(
+                    n,
+                    failed,
+                    dynamic = self.dynamic,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            }
             return None;
         };
         taken[first..first + n].fill(true);
@@ -972,5 +1052,186 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// The view heap the world makes (#747).
+    const WORLD_VIEWS: u32 = 1_245_184;
+
+    /// [`view_layout`] on a host that takes view heaps up to `cap` slots:
+    /// (total, title slots, dynamic slots).
+    fn layout_on(cap: u32, count: u32) -> Option<(u32, u32, u32)> {
+        view_layout(count, |n| (n <= cap).then_some(n))
+    }
+
+    /// A host without a cap (AMD, WARP) keeps every title slot and the full
+    /// dynamic range.
+    #[test]
+    fn uncapped_view_heaps_keep_every_title_slot() {
+        for count in [4, 737_856, 934_464, WORLD_VIEWS] {
+            assert_eq!(
+                layout_on(u32::MAX, count),
+                Some((count + DYNAMIC, count, DYNAMIC)),
+                "{count}"
+            );
+        }
+    }
+
+    /// On a heap capped at 1,000,000 (NVIDIA) the world's heap keeps the
+    /// full dynamic range: with 2^16 its fresh tables ran out inside every
+    /// submission and most world draws were dropped (#747).
+    #[test]
+    fn capped_view_heaps_keep_the_full_dynamic_range() {
+        assert_eq!(
+            layout_on(PORTABLE_VIEWS, WORLD_VIEWS),
+            Some((PORTABLE_VIEWS, PORTABLE_VIEWS - DYNAMIC, DYNAMIC))
+        );
+    }
+
+    /// A capped heap that has room for the title's slots keeps all of them
+    /// and gives the dynamic range the rest; title slots are only given up
+    /// where the title's heap does not fit anyway.
+    #[test]
+    fn capped_view_heaps_give_title_slots_up_only_past_the_cap() {
+        let cap = PORTABLE_VIEWS;
+        assert_eq!(
+            layout_on(cap, 700_000),
+            Some((700_000 + DYNAMIC, 700_000, DYNAMIC))
+        );
+        assert_eq!(layout_on(cap, 900_000), Some((cap, 900_000, 100_000)));
+        assert_eq!(
+            layout_on(cap, cap - MIN_DYNAMIC),
+            Some((cap, cap - MIN_DYNAMIC, MIN_DYNAMIC))
+        );
+        for count in (0..=2_000_000).step_by(997) {
+            let (total, title, dynamic) = layout_on(cap, count).unwrap();
+            assert!(total <= cap && title + dynamic == total, "{count}");
+            assert!((MIN_DYNAMIC..=DYNAMIC).contains(&dynamic), "{count}");
+            assert!(title <= count, "{count}");
+            assert!(
+                title == count || dynamic == DYNAMIC,
+                "{count}: title slots lost"
+            );
+        }
+    }
+
+    /// The split before #747, as reference: `count` + [`DYNAMIC`], else
+    /// `count` + [`MIN_DYNAMIC`], else (past the portable limit) the
+    /// portable limit with [`MIN_DYNAMIC`] dynamic slots.
+    fn before_747(cap: u32, count: u32) -> Option<(u32, u32)> {
+        let takes = |n: u32| n <= cap;
+        if takes(count.saturating_add(DYNAMIC)) {
+            Some((count, DYNAMIC))
+        } else if takes(count.saturating_add(MIN_DYNAMIC)) {
+            Some((count, MIN_DYNAMIC))
+        } else if count.saturating_add(MIN_DYNAMIC) > PORTABLE_VIEWS && takes(PORTABLE_VIEWS) {
+            Some((PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC))
+        } else {
+            None
+        }
+    }
+
+    /// On every host cap the split gives no fewer title slots and no fewer
+    /// dynamic slots than before, except where #747 trades them: where the
+    /// title's heap was cut to the portable limit before, the cut keeps the
+    /// full dynamic range now. A host that takes the title's heap with the
+    /// fewest dynamic slots (1.31M views were reported on an RTX 4060
+    /// Laptop, #735) keeps every title slot.
+    #[test]
+    fn view_heap_split_is_never_worse_than_before() {
+        let caps = [900_000, PORTABLE_VIEWS, 1_310_720, 1_400_000, u32::MAX];
+        for cap in caps {
+            for count in (0..=2_000_000).step_by(991).chain([WORLD_VIEWS]) {
+                let new = layout_on(cap, count).map(|(_, t, d)| (t, d));
+                let old = before_747(cap, count);
+                let cut = Some((PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC));
+                let traded = count > PORTABLE_VIEWS - MIN_DYNAMIC && old == cut;
+                match (old, new) {
+                    (None, None) => {}
+                    (Some((t0, d0)), Some((t, d))) if traded => {
+                        assert_eq!((t0, d0), (PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC));
+                        assert_eq!((t, d), (PORTABLE_VIEWS - DYNAMIC, DYNAMIC));
+                    }
+                    (Some((t0, d0)), Some((t, d))) => {
+                        assert!(t >= t0 && d >= d0, "cap {cap}, count {count}");
+                    }
+                    _ => panic!("cap {cap}, count {count}: {old:?} before, {new:?} now"),
+                }
+            }
+        }
+        // The world's heap on a host capped above the portable limit.
+        assert_eq!(
+            layout_on(1_400_000, WORLD_VIEWS),
+            Some((WORLD_VIEWS + MIN_DYNAMIC, WORLD_VIEWS, MIN_DYNAMIC))
+        );
+    }
+
+    /// The world's view heap on the real device: uncapped or capped at the
+    /// portable limit (NVIDIA), it holds the full dynamic range, and every
+    /// dynamic slot up to the heap's last can be taken and written.
+    /// CPU-side descriptor writes only; nothing is submitted.
+    #[test]
+    fn world_view_heap_has_the_full_dynamic_range_on_the_host() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let heap = HostHeap::new(false, WORLD_VIEWS).expect("the world's view heap");
+        let total = heap.count + heap.dynamic;
+        eprintln!(
+            "world view heap: {} title slots, {} dynamic",
+            heap.count, heap.dynamic
+        );
+        if heap.count == WORLD_VIEWS && heap.dynamic == MIN_DYNAMIC {
+            // A host capped between the two: the split before #747.
+            eprintln!("host capped above the portable limit; the full range is not checked");
+        } else {
+            assert_eq!(heap.dynamic, DYNAMIC);
+            assert!(heap.count == WORLD_VIEWS || total == PORTABLE_VIEWS);
+        }
+        let dynamic = heap.dynamic;
+        // Tables of 140 slots (the world's large ones, #747) until full.
+        const TABLE: u32 = 140;
+        let mut tables = 0;
+        while let Some(first) = heap.dynamic(TABLE) {
+            assert_eq!(first, heap.count + tables * TABLE);
+            tables += 1;
+        }
+        assert_eq!(tables, dynamic / TABLE);
+        // Exhausted: what is left at the end is given out, nothing more,
+        // and no run is taken in part.
+        let left = dynamic % TABLE;
+        assert_eq!(heap.dynamic(left + 1), None);
+        assert_eq!(heap.dynamic(left), Some(total - left));
+        assert_eq!(heap.dynamic(1), None);
+        // A table given back (its list reset) is taken again, and only it.
+        let fifth = heap.count + 5 * TABLE;
+        heap.release(fifth, TABLE);
+        assert_eq!(heap.dynamic(TABLE + 1), None);
+        assert_eq!(heap.dynamic(TABLE), Some(fifth));
+        let last = heap.count + heap.dynamic - 1;
+        heap.make_null(last);
+        let host = host().unwrap();
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        // Device-removed reports tell title slots from dynamic ones.
+        // SAFETY: a live shader-visible heap.
+        let start = unsafe { heap.heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        let at = |slot: u32| start + u64::from(slot) * u64::from(heap.step);
+        let title = format!("inside, title slot {}", heap.count - 1);
+        assert!(near_heaps(at(heap.count - 1)).contains(&title));
+        let dynamic = format!("inside, dynamic slot 0 (slot {})", heap.count);
+        assert!(near_heaps(at(heap.count)).contains(&dynamic));
+    }
+
+    /// Where an address lies against a heap of 10 slots of 32 bytes, the
+    /// first 6 the title's.
+    #[test]
+    fn device_removed_reports_name_title_and_dynamic_slots() {
+        let place = |va| place_in_heap(va, 0x1000, 320, 32, 6);
+        assert_eq!(place(0xf00), "0x100 below");
+        assert_eq!(place(0x1000), "inside, title slot 0");
+        assert_eq!(place(0x1000 + 5 * 32 + 31), "inside, title slot 5");
+        assert_eq!(place(0x1000 + 6 * 32), "inside, dynamic slot 0 (slot 6)");
+        assert_eq!(place(0x1000 + 9 * 32), "inside, dynamic slot 3 (slot 9)");
+        assert_eq!(place(0x1000 + 10 * 32), "0x0 past its end (slot 10)");
     }
 }
